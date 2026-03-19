@@ -1,51 +1,53 @@
 # ascii-depth
 
 Real-time terminal ASCII depth map renderer.
-Point your webcam at anything and watch a live green-on-black depth heatmap render in your terminal — near objects in dense, bright characters; far objects in sparse, dim ones.
+Point your webcam at anything and watch a live white-on-black depth heatmap render in your terminal — near objects appear as bright white dense characters; far objects fade to black.
 
 ```
-Near  →  @ # % * +  →  bright green
-Far   →  . : - =    →  dim green
-      →  (space)    →  background
+Near  →  @ # % * +  →  bright white
+Far   →  . : - =    →  dim grey
+      →  (space)    →  black (background)
 ```
 
-Built with **MiDaS** (monocular depth estimation) and a **Rust extension** that handles per-frame normalisation and character mapping in parallel across all CPU cores.
+Built with **MiDaS_small** (monocular depth estimation) and a **Rust extension** that handles per-frame normalisation and character mapping in parallel across all CPU cores.  Depth inference runs on a background thread so the display never stalls waiting for PyTorch.
 
 ---
 
 ## How it works
 
 ```
-┌─────────────┐     BGR frame      ┌───────────────────┐
-│  Webcam     │ ────────────────▶  │  MiDaS_small      │
-│  (OpenCV)   │                    │  (PyTorch)         │
-└─────────────┘                    └────────┬──────────┘
-                                            │ raw inverse-depth
-                                            │ float32 array (H × W)
-                                            ▼
-                                   ┌───────────────────┐
-                                   │  Rust extension   │
-                                   │  ascii_depth_rs   │
-                                   │                   │
-                                   │  normalize_depth()│  ← parallel min-max
-                                   │  depth_to_ascii() │  ← parallel resample
-                                   └────────┬──────────┘
-                                            │ Vec<String>  (one per row)
-                                            ▼
-                                   ┌───────────────────┐
-                                   │  renderer.py      │
-                                   │                   │
-                                   │  ANSI 24-bit green│
-                                   │  single write()   │
-                                   └───────────────────┘
-                                            │
-                                            ▼
-                                       Terminal 🖥️
+┌─────────────┐  BGR frame   ┌──────────────────────────────────────┐
+│  Webcam     │ ───────────▶ │  Background thread (_DepthWorker)    │
+│  (OpenCV)   │              │                                       │
+└─────────────┘              │  MiDaS_small (PyTorch)               │
+       │                     │  → raw inverse-depth float32 (H × W) │
+       │                     └──────────────────┬───────────────────┘
+       │                                        │ latest depth (non-blocking)
+       │                                        ▼
+       │                     ┌──────────────────────────────────────┐
+       │                     │  Rust extension  ascii_depth_rs      │
+       └──────────────────▶  │                                      │
+         (every frame)       │  normalize_depth()  ← parallel rayon │
+                             │  depth_to_ascii()   ← parallel rayon │
+                             └──────────────────┬───────────────────┘
+                                                │ Vec<String> (one per row)
+                                                ▼
+                             ┌──────────────────────────────────────┐
+                             │  renderer.py                         │
+                             │  ANSI 24-bit white, single write()   │
+                             └──────────────────────────────────────┘
+                                                │
+                                                ▼
+                                           Terminal 🖥️
 ```
+
+### Why a background thread?
+
+MiDaS inference takes ~50–100 ms on CPU.  Running it synchronously would block the display for every frame, capping output at ~10–20 FPS.  A dedicated `_DepthWorker` daemon thread runs inference continuously on the most recently captured frame.  The render loop always uses the latest available depth result without waiting, so the terminal updates as fast as the Rust renderer can write — typically 25–35 FPS on CPU.
 
 ### Why Rust for the ASCII mapping?
 
-The depth array at 640×480 contains ~300 k values that must be resampled to the terminal grid (often 200×50 or similar), looked up in a character table, and colour-escaped — every frame, 15–30 times per second.  Doing this in pure Python with per-element loops would be the bottleneck.  The Rust extension releases the Python GIL and processes all rows in parallel with [rayon](https://github.com/rayon-rs/rayon), keeping the mapping step under 2 ms regardless of terminal size.
+The depth array at 640×480 contains ~300 k values that must be resampled to the terminal grid, looked up in a character table, and colour-escaped — every frame, 25–35 times per second.  The Rust extension releases the Python GIL and processes all rows in parallel with [rayon](https://github.com/rayon-rs/rayon), keeping the mapping step under 2 ms regardless of terminal size.
 
 ---
 
@@ -98,7 +100,7 @@ pip install -r requirements.txt
 python -m ascii_depth.main
 ```
 
-Press **Ctrl-C** to quit.  The terminal cursor and colours are restored automatically.
+Press **Ctrl-C** to quit.  The terminal cursor and colours are restored automatically.  Closing the terminal window also triggers a clean shutdown — the camera is always released before the process exits.
 
 ---
 
@@ -136,9 +138,9 @@ ascii_depth/
 ├── python/
 │   └── ascii_depth/
 │       ├── capture.py          # OpenCV camera context manager
-│       ├── depth.py            # MiDaS depth inference (model cached after first load)
-│       ├── renderer.py         # ANSI terminal renderer
-│       └── main.py             # CLI entry point and main loop
+│       ├── depth.py            # MiDaS_small inference (model cached after first load)
+│       ├── renderer.py         # ANSI 24-bit white terminal renderer
+│       └── main.py             # CLI entry point, threaded depth worker, signal handling
 ├── Cargo.toml                  # Rust crate manifest
 ├── pyproject.toml              # Python package + maturin build config
 └── requirements.txt
@@ -152,14 +154,14 @@ ascii_depth/
 |---|---|---|
 | MiDaS_small inference | ~15–25 FPS | ~30+ FPS |
 | Rust normalise + map | < 2 ms | < 2 ms |
-| Terminal write | < 1 ms | < 1 ms |
+| Terminal render (display FPS) | ~25–35 FPS | ~25–35 FPS |
 
-Depth inference is the bottleneck on CPU.  If you need higher frame rates, try reducing `--width` / `--height` (smaller terminal grid = faster Rust step) or switching to a GPU.
+Display FPS is decoupled from inference FPS by the background thread.  The terminal updates whenever a new depth result is ready, reusing the previous result between inference cycles.
 
 ---
 
 ## Customisation tips
 
-- **Different depth model:** edit `depth.py` — change `"MiDaS_small"` to `"DPT_Large"` and `small_transform` to `dpt_transform` for higher accuracy at ~4× the cost.
-- **Colour scheme:** edit the `_green()` function in `renderer.py` to change the RGB values in the ANSI escape.
+- **Different depth model:** edit `depth.py` — change `"MiDaS_small"` to `"DPT_Large"` and `small_transform` to `dpt_transform` for higher accuracy at ~4× the CPU cost.
+- **Colour scheme:** edit the `_white()` function in `renderer.py` to change the RGB values in the ANSI escape (e.g. set `R=0, B=0` for green, or `R=G=0` for blue).
 - **Character set:** any ordered string works as `--charset`; block elements (`░▒▓█`) or Braille patterns can give a denser look on capable terminals.
