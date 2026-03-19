@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.6,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ascii-depth"
+version = "0.1.0"
+description = "Real-time ASCII depth map renderer using MiDaS and a Rust extension"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "ascii_depth.ascii_depth_rs"
+features = ["pyo3/extension-module"]
